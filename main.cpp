@@ -24,7 +24,7 @@
  *                   Linux/Mac: g++ -std=c++11 -pthread -o controle
  *                     controle_entregas_retiradas_estoque.cpp
  *                   Visual Studio: projeto de console, nada a configurar.
- *  Versao ........: 3.0
+ *  Versao ........: 3.1
  * ==========================================================================
  */
 #ifdef _WIN32
@@ -314,16 +314,53 @@ string normalizarData(const string& s) {
     return dataValida(r) ? r : "";
 }
 
+/* As entregas e retiradas acontecem no fim de semana. "Sabado atual" e o
+   sabado deste fim de semana (de segunda a sabado: o proximo; no domingo:
+   o de ontem, porque o fim de semana ainda esta em andamento). */
+string sabadoAtual() {
+    string h = hoje();
+    int w = montarTm(h, 0).tm_wday;
+    if (w == 6) return h;
+    if (w == 0) return somarDias(h, -1);
+    return somarDias(h, 6 - w);
+}
+
+/* Aceita a data ou os atalhos hoje, sex, sab, dom e seg (do fim de semana). */
+string interpretarData(const string& s) {
+    string t = maiusculas(trim(s));
+    if (t == "HOJE") return hoje();
+    if (t == "SEX" || t == "SEXTA") return somarDias(sabadoAtual(), -1);
+    if (t == "SAB" || t == "SABADO") return sabadoAtual();
+    if (t == "DOM" || t == "DOMINGO") return somarDias(sabadoAtual(), 1);
+    if (t == "SEG" || t == "SEGUNDA") return somarDias(sabadoAtual(), 2);
+    return normalizarData(s);
+}
+
 string lerData(const string& prompt, bool enterHoje) {
     while (true) {
-        string s = lerLinha(prompt + (enterHoje ? " (DD/MM/AAAA, Enter = hoje): "
-                                                : " (DD/MM/AAAA): "));
+        string s = lerLinha(prompt + (enterHoje ? " (DD/MM, sab, dom; Enter = hoje): "
+                                                : " (DD/MM, sab, dom): "));
         if (s.empty() && enterHoje) return hoje();
-        string d = normalizarData(s);
+        string d = interpretarData(s);
         if (!d.empty()) return d;
-        cout << "  ! Data invalida.\n";
+        cout << "  ! Data invalida. Exemplos: 14/11, sab, dom.\n";
     }
 }
+
+/* Enter devolve a data padrao (usado para sugerir sabado e domingo). */
+string lerDataPadrao(const string& prompt, const string& padrao) {
+    while (true) {
+        string s = lerLinha(prompt + " (DD/MM, sab, dom; Enter = " + diaSemana(padrao).substr(0, 3) +
+                            " " + padrao.substr(0, 5) + "): ");
+        if (s.empty()) return padrao;
+        string d = interpretarData(s);
+        if (!d.empty()) return d;
+        cout << "  ! Data invalida. Exemplos: 14/11, sab, dom.\n";
+    }
+}
+
+/* AAAA-MM-DD para nomes de arquivo */
+string dataArquivo(const string& d) { return d.substr(6, 4) + "-" + d.substr(3, 2) + "-" + d.substr(0, 2); }
 
 /* Aceita 8, 8h, 8h30, 8:30, 08:30. "" = sem horario. "?" = invalido. */
 string normalizarHorario(const string& s) {
@@ -1032,7 +1069,7 @@ int criarRetirada(int idEntrega) {
     Servico r = servicos[ie];
     cout << "\n--- Retirada de " << nomeCliente(r.clienteId) << " (entrega em " << r.data << ") ---\n";
     while (true) {
-        r.data = lerData("Data da retirada", false);
+        r.data = lerDataPadrao("Data da retirada", somarDias(servicos[ie].data, 1));
         if (chaveData(r.data) >= chaveData(servicos[ie].data)) break;
         cout << "  ! A retirada nao pode ser antes da entrega.\n";
     }
@@ -1060,12 +1097,12 @@ void novoPedido() {
     Servico e;
     e.clienteId = cid;
     e.tipo = 'E';
-    e.data = lerData("Data da entrega", false);
+    e.data = lerDataPadrao("Data da entrega", sabadoAtual());
     e.horario = lerHorario("Horario da entrega (Enter = sem horario): ", false);
 
     Servico r;
     while (true) {
-        r.data = lerData("Data da retirada", false);
+        r.data = lerDataPadrao("Data da retirada", somarDias(e.data, 1));
         if (chaveData(r.data) >= chaveData(e.data)) break;
         cout << "  ! A retirada nao pode ser antes da entrega.\n";
     }
@@ -1130,6 +1167,38 @@ void novoPedido() {
 /* ======================================================================
  *                  PROGRAMACAO DO DIA / ROTEIRO (RF07-RF08)
  * ====================================================================== */
+bool temServico(const string& d) {
+    for (size_t i = 0; i < servicos.size(); i++)
+        if (servicos[i].data == d && servicos[i].status != "CANCELADO") return true;
+    return false;
+}
+
+/* Sabado e domingo do fim de semana, mais sexta ou segunda se houver
+   entrega ou retirada nesses dias (feriado). */
+vector<string> diasFimDeSemana() {
+    string sab = sabadoAtual();
+    vector<string> v;
+    if (temServico(somarDias(sab, -1))) v.push_back(somarDias(sab, -1));
+    v.push_back(sab);
+    v.push_back(somarDias(sab, 1));
+    if (temServico(somarDias(sab, 2))) v.push_back(somarDias(sab, 2));
+    return v;
+}
+
+/* Soma os itens de uma viagem: tipo 'E' = o que carregar no deposito,
+   tipo 'R' = o que vai ser recolhido nos clientes. */
+string somaDaViagem(const vector<Servico>& lista, char viagem, char tipo) {
+    vector<int> soma(itens.size(), 0);
+    for (size_t i = 0; i < lista.size(); i++) {
+        char v = lista[i].rota.empty() ? '-' : lista[i].rota[0];
+        if (v != viagem || lista[i].tipo != tipo) continue;
+        for (size_t k = 0; k < itens.size(); k++) soma[k] += qtdDoItem(lista[i], itens[k].id);
+    }
+    string r;
+    for (size_t k = 0; k < itens.size(); k++)
+        if (soma[k]) r += (r.empty() ? "" : ", ") + to_string(soma[k]) + " " + itens[k].nome;
+    return r;
+}
 string gerarRoteiro(const string& data) {
     vector<Servico> dia;
     for (size_t i = 0; i < servicos.size(); i++)
@@ -1153,6 +1222,9 @@ string gerarRoteiro(const string& data) {
         if (viagem != viagemAtual) {
             o << (viagem == '-' ? "--- SEM ROTA DEFINIDA ---\n"
                                 : string("--- VIAGEM ") + viagem + " ---\n");
+            string carga = somaDaViagem(dia, viagem, 'E'), recolhe = somaDaViagem(dia, viagem, 'R');
+            if (!carga.empty()) o << "    Carregar no deposito: " << carga << '\n';
+            if (!recolhe.empty()) o << "    Recolher nos clientes: " << recolhe << '\n';
             viagemAtual = viagem;
         }
         o << linhaServico(s, false, true);
@@ -1176,12 +1248,20 @@ string gerarRoteiro(const string& data) {
 }
 
 void programacaoDoDia() {
-    string data = lerData("\nData da programacao", true);
-    string texto = gerarRoteiro(data);
+    string s = lerLinha("\nData da programacao (DD/MM, sab, dom; Enter = fim de semana): ");
+    vector<string> dias;
+    if (s.empty()) dias = diasFimDeSemana();
+    else {
+        string d = interpretarData(s);
+        if (d.empty()) { cout << "  ! Data invalida.\n"; return; }
+        dias.push_back(d);
+    }
+    string texto;
+    for (size_t i = 0; i < dias.size(); i++) texto += gerarRoteiro(dias[i]);
     cout << texto;
     if (lerSimNao("Gerar arquivo TXT para imprimir?")) {
-        string nome = "roteiro_" + data.substr(6, 4) + "-" + data.substr(3, 2) + "-" +
-                      data.substr(0, 2) + ".txt";
+        string nome = dias.size() > 1 ? "roteiro_fim_de_semana_" + dataArquivo(sabadoAtual()) + ".txt"
+                                      : "roteiro_" + dataArquivo(dias[0]) + ".txt";
         ofstream f(nome.c_str());
         f << texto;
         cout << "Arquivo gerado: " << nome << '\n';
@@ -1270,7 +1350,7 @@ void reagendar() {
     string d = lerLinha("Nova data [" + servicos[idx].data + "]: ");
     string novaData = servicos[idx].data;
     if (!d.empty()) {
-        novaData = normalizarData(d);
+        novaData = interpretarData(d);
         if (novaData.empty()) { cout << "  ! Data invalida. Nada foi alterado.\n"; return; }
     }
     string h = lerLinha("Novo horario [" + servicos[idx].horario + "]" +
@@ -1332,6 +1412,70 @@ void cancelarPedido() {
     cout << "Cancelado. Os itens voltam a ficar livres no periodo.\n";
 }
 
+/* Proximo numero de parada livre em uma viagem (A3 -> A4). */
+int proximaParada(const string& data, char letra, int ignorar) {
+    int m = 0;
+    for (size_t i = 0; i < servicos.size(); i++) {
+        const Servico& s = servicos[i];
+        if (s.id == ignorar || s.status == "CANCELADO" || s.data != data || s.rota.empty() || s.rota[0] != letra) continue;
+        m = max(m, atoi(s.rota.substr(1).c_str()));
+    }
+    return m + 1;
+}
+
+/* Ultima parada da ultima viagem do dia (ex.: D3 -> D4). */
+string rotaFimDaFila(const string& data, int ignorar) {
+    char ultima = 0;
+    for (size_t i = 0; i < servicos.size(); i++) {
+        const Servico& s = servicos[i];
+        if (s.id == ignorar || s.status == "CANCELADO" || s.data != data || s.rota.empty()) continue;
+        if (s.rota[0] > ultima) ultima = s.rota[0];
+    }
+    if (!ultima) return "";
+    return string(1, ultima) + to_string(proximaParada(data, ultima, ignorar));
+}
+
+/* Usado pelo menu e pelo celular. Chamar com a trava fechada. */
+string mandarParaFimDaFila(int idx) {
+    string r = rotaFimDaFila(servicos[idx].data, servicos[idx].id);
+    servicos[idx].rota = r;
+    const string nota = "nao recebeu no horario, foi para o fim da fila";
+    servicos[idx].obs = servicos[idx].obs.empty() ? nota : servicos[idx].obs + " / " + nota;
+    salvarServicos();
+    return r;
+}
+
+void trocarViagem() {
+    int idx = pedirServico("\nID da entrega ou retirada (0 = voltar): ");
+    if (idx < 0) return;
+    if (servicos[idx].status != "PENDENTE") { cout << "  ! So da para mudar uma parada pendente.\n"; return; }
+    while (true) {
+        string r = normalizarRota(lerLinha("Nova viagem (letra, ex.: B) ou rota completa (ex.: B2), Enter = desistir: "));
+        if (r.empty()) { cout << "Nada foi alterado.\n"; return; }
+        if (r.size() == 1 && r[0] >= 'A' && r[0] <= 'Z')
+            r += to_string(proximaParada(servicos[idx].data, r[0], servicos[idx].id));
+        if (!rotaValida(r)) { cout << "  ! Use uma letra (B) ou letra e numero (B2).\n"; continue; }
+        if (!conferirRotaLivre(servicos[idx].data, r, servicos[idx].id)) continue;
+        Trava t;
+        string antiga = servicos[idx].rota.empty() ? "-" : servicos[idx].rota;
+        servicos[idx].rota = r;
+        salvarServicos();
+        cout << nomeCliente(servicos[idx].clienteId) << ": " << antiga << " -> " << r << '\n';
+        return;
+    }
+}
+
+void fimDaFila() {
+    int idx = pedirServico("\nID da parada em que o cliente nao recebeu (0 = voltar): ");
+    if (idx < 0) return;
+    if (servicos[idx].status != "PENDENTE") { cout << "  ! Essa parada nao esta pendente.\n"; return; }
+    if (!lerSimNao("Mandar " + nomeCliente(servicos[idx].clienteId) + " para o fim da fila do dia?")) return;
+    Trava t;
+    string r = mandarParaFimDaFila(idx);
+    cout << nomeCliente(servicos[idx].clienteId) << " agora e a ultima parada do dia ("
+         << (r.empty() ? "sem rota" : r) << ").\n";
+}
+
 void menuAgendamentos() {
     while (true) {
         cout << "\n----- BAIXA E ALTERACOES -----\n"
@@ -1339,13 +1483,17 @@ void menuAgendamentos() {
                 "2 - Desfazer baixa\n"
                 "3 - Alterar data, horario ou rota\n"
                 "4 - Cancelar pedido\n"
+                "5 - Trocar de viagem (ex.: da A para a B)\n"
+                "6 - Cliente nao recebeu: mandar para o fim da fila\n"
                 "0 - Voltar\n";
-        int op = lerInteiro("Opcao: ", 0, 4);
+        int op = lerInteiro("Opcao: ", 0, 6);
         if (op == 0) return;
         if (op == 1) darBaixa();
         if (op == 2) desfazerBaixa();
         if (op == 3) reagendar();
         if (op == 4) cancelarPedido();
+        if (op == 5) trocarViagem();
+        if (op == 6) fimDaFila();
     }
 }
 
@@ -1549,49 +1697,19 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:6px 4px;b
 td.n{text-align:right;font-family:ui-monospace,Consolas,monospace}
 .me{display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
 .me input{border:1px solid var(--line);background:var(--card2);color:var(--ink);border-radius:8px;padding:8px 10px;font:inherit;flex:1 1 140px;min-width:0}
-.empty{padding:24px;text-align:center;color:var(--muted)}footer{color:var(--muted);font-size:12.5px;text-align:center;padding-bottom:20px}
+.load{padding:7px 12px;border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}.load b{color:var(--ink);font-family:ui-monospace,Consolas,monospace}.dh{margin:6px 0 10px;font:700 20px "Arial Narrow",Arial,sans-serif;text-transform:uppercase;color:var(--muted);letter-spacing:.03em}.dayblock+.dayblock{margin-top:22px}.btn.lnk{border:0;background:none;color:var(--muted);text-decoration:underline;padding:6px 0;font-weight:500}.empty{padding:24px;text-align:center;color:var(--muted)}footer{color:var(--muted);font-size:12.5px;text-align:center;padding-bottom:20px}
 )CSS";
 
-/* Monta a pagina do dia. 'servidor' liga os botoes de baixa. */
-string htmlPainel(const string& dia, bool servidor, const string& motorista, const string& msg, bool msgErro) {
+/* Bloco de um dia: viagens com o que carregar e cada parada.
+   'servidor' liga os botoes de baixa; 'volta' e o endereco de retorno. */
+string htmlDia(const string& dia, bool servidor, const string& volta, bool mostrarTitulo) {
     ostringstream o;
     vector<Servico> lista;
     for (size_t i = 0; i < servicos.size(); i++)
         if (servicos[i].data == dia && servicos[i].status != "CANCELADO") lista.push_back(servicos[i]);
     sort(lista.begin(), lista.end(), vemAntes);
-    int feitos = 0, ent = 0, ret = 0;
-    for (size_t i = 0; i < lista.size(); i++) {
-        if (lista[i].status == "FEITO") feitos++;
-        if (lista[i].tipo == 'E') ent++; else ret++;
-    }
-    int alertas = contarAlertas();
-    string link = "/?d=";
-
-    o << "<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\">"
-         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
-    if (servidor) o << "<meta http-equiv=\"refresh\" content=\"30;url=" << link << dataParaLink(dia) << "\">";
-    o << "<title>Painel de Rotas</title><style>" << CSS_PAINEL << "</style></head><body>"
-      << "<header><div class=\"wrap\"><h1><span class=\"sign\">A1</span>Painel de Rotas</h1>";
-    if (servidor)
-        o << "<nav class=\"nav\"><a class=\"btn sm\" href=\"" << link << dataParaLink(somarDias(dia, -1)) << "\">&lsaquo;</a>"
-          << "<a class=\"btn sm\" href=\"/\">Hoje</a>"
-          << "<a class=\"btn sm\" href=\"" << link << dataParaLink(somarDias(dia, 1)) << "\">&rsaquo;</a></nav>";
-    o << "</div></header><main class=\"wrap\">";
-
-    o << "<div class=\"day\"><h2>" << diaSemana(dia) << " " << dia.substr(0, 5) << "</h2><span>"
-      << (dia == hoje() ? "hoje" : dia) << "</span></div>";
-    if (!msg.empty()) o << "<div class=\"msg " << (msgErro ? "bad" : "ok") << "\">" << msg << "</div>";
-    if (servidor)
-        o << "<form class=\"me\" method=\"post\" action=\"/nome\"><input type=\"hidden\" name=\"d\" value=\""
-          << dataParaLink(dia) << "\"><b>Motorista</b><input name=\"nome\" value=\"" << h(motorista)
-          << "\" placeholder=\"Seu nome\" maxlength=\"40\"><button class=\"btn\">Salvar</button></form>";
-
-    o << "<div class=\"kpis\"><div class=\"kpi\"><small>Paradas feitas</small><b>" << feitos << "/" << lista.size() << "</b></div>"
-      << "<div class=\"kpi\"><small>Entregas</small><b>" << ent << "</b></div>"
-      << "<div class=\"kpi\"><small>Retiradas</small><b>" << ret << "</b></div>"
-      << "<div class=\"kpi" << (alertas ? " hot" : "") << "\"><small>Alertas de estoque</small><b>" << alertas << "</b></div></div>";
-
-    o << "<div class=\"cols\"><div>";
+    o << "<section class=\"dayblock\">";
+    if (mostrarTitulo) o << "<h3 class=\"dh\">" << diaSemana(dia) << " " << dia.substr(0, 5) << "</h3>";
     if (lista.empty()) o << "<div class=\"trip\"><div class=\"empty\">Nada agendado para este dia.</div></div>";
     char viagemAtual = 0;
     for (size_t i = 0; i < lista.size(); i++) {
@@ -1607,6 +1725,11 @@ string htmlPainel(const string& dia, bool servidor, const string& motorista, con
             o << "<div class=\"trip\"><h3>" << (viagem == '-' ? "<span class=\"sign none\">?</span>Sem rota definida"
                                                               : string("<span class=\"sign\">") + viagem + "</span>Viagem " + viagem)
               << "<small>" << fe << "/" << tot << " feitas</small></h3>";
+            string carga = somaDaViagem(lista, viagem, 'E'), recolhe = somaDaViagem(lista, viagem, 'R');
+            if (!carga.empty() || !recolhe.empty())
+                o << "<div class=\"load\">" << (carga.empty() ? "" : "Carregar: <b>" + h(carga) + "</b>")
+                  << (!carga.empty() && !recolhe.empty() ? " &middot; " : "")
+                  << (recolhe.empty() ? "" : "Recolher: <b>" + h(recolhe) + "</b>") << "</div>";
             viagemAtual = viagem;
         }
         int ic = indiceCliente(s.clienteId);
@@ -1622,27 +1745,80 @@ string htmlPainel(const string& dia, bool servidor, const string& motorista, con
         if (!tel.empty()) extra += "Tel. " + h(tel);
         if (!s.obs.empty()) extra += (extra.empty() ? "" : " &middot; ") + h(s.obs);
         if (!extra.empty()) o << "<div class=\"extra\">" << extra << "</div>";
+        string ocultos = "<input type=\"hidden\" name=\"id\" value=\"" + to_string(s.id) +
+                         "\"><input type=\"hidden\" name=\"volta\" value=\"" + h(volta) + "\">";
         if (s.status == "FEITO") {
             o << "<div class=\"done\"><span class=\"pill FEITO\">Feito</span>"
               << (s.motorista.empty() ? "" : "por " + h(s.motorista));
             if (servidor)
-                o << "<form method=\"post\" action=\"/desfazer\" style=\"margin-left:auto\"><input type=\"hidden\" name=\"id\" value=\""
-                  << s.id << "\"><input type=\"hidden\" name=\"d\" value=\"" << dataParaLink(dia)
-                  << "\"><button class=\"btn sm\">Desfazer</button></form>";
+                o << "<form method=\"post\" action=\"/desfazer\" style=\"margin-left:auto\">" << ocultos
+                  << "<button class=\"btn sm\">Desfazer</button></form>";
             o << "</div>";
         } else if (servidor) {
-            o << "<form method=\"post\" action=\"/baixa\"><input type=\"hidden\" name=\"id\" value=\"" << s.id
-              << "\"><input type=\"hidden\" name=\"d\" value=\"" << dataParaLink(dia) << "\"><button class=\"btn ok\">&check; "
-              << (s.tipo == 'E' ? "Entregue" : "Retirado") << "</button></form>";
+            o << "<form method=\"post\" action=\"/baixa\">" << ocultos << "<button class=\"btn ok\">&check; "
+              << (s.tipo == 'E' ? "Entregue" : "Retirado") << "</button></form>"
+              << "<form method=\"post\" action=\"/fila\">" << ocultos
+              << "<button class=\"btn lnk\">Cliente n&atilde;o recebeu &rarr; fim da fila</button></form>";
         } else {
             o << "<div class=\"done\"><span class=\"pill PENDENTE\">Pendente</span></div>";
         }
         o << "</div>";
     }
     if (viagemAtual) o << "</div>";
+    o << "</section>";
+    return o.str();
+}
+
+/* Pagina completa: um dia ou o fim de semana inteiro. */
+string htmlPainel(const vector<string>& dias, bool servidor, const string& motorista,
+                  const string& msg, bool msgErro, const string& volta) {
+    ostringstream o;
+    int total = 0, feitos = 0, ent = 0, ret = 0;
+    for (size_t i = 0; i < servicos.size(); i++) {
+        const Servico& s = servicos[i];
+        if (s.status == "CANCELADO" || find(dias.begin(), dias.end(), s.data) == dias.end()) continue;
+        total++;
+        if (s.status == "FEITO") feitos++;
+        if (s.tipo == 'E') ent++; else ret++;
+    }
+    int alertas = contarAlertas();
+    bool fds = dias.size() > 1;
+
+    o << "<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\">"
+         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+    if (servidor) o << "<meta http-equiv=\"refresh\" content=\"30;url=" << h(volta) << "\">";
+    o << "<title>Painel de Rotas</title><style>" << CSS_PAINEL << "</style></head><body>"
+      << "<header><div class=\"wrap\"><h1><span class=\"sign\">A1</span>Painel de Rotas</h1>";
+    if (servidor) {
+        o << "<nav class=\"nav\">";
+        if (!fds) o << "<a class=\"btn sm\" href=\"/?d=" << dataParaLink(somarDias(dias[0], -1)) << "\">&lsaquo;</a>";
+        o << "<a class=\"btn sm\" href=\"/\">Fim de semana</a><a class=\"btn sm\" href=\"/?d=" << dataParaLink(hoje()) << "\">Hoje</a>";
+        if (!fds) o << "<a class=\"btn sm\" href=\"/?d=" << dataParaLink(somarDias(dias[0], 1)) << "\">&rsaquo;</a>";
+        o << "</nav>";
+    }
+    o << "</div></header><main class=\"wrap\">";
+
+    if (fds)
+        o << "<div class=\"day\"><h2>Fim de semana</h2><span>" << dias.front().substr(0, 5) << " a "
+          << dias.back().substr(0, 5) << "</span></div>";
+    else
+        o << "<div class=\"day\"><h2>" << diaSemana(dias[0]) << " " << dias[0].substr(0, 5) << "</h2><span>"
+          << (dias[0] == hoje() ? "hoje" : dias[0]) << "</span></div>";
+    if (!msg.empty()) o << "<div class=\"msg " << (msgErro ? "bad" : "ok") << "\">" << msg << "</div>";
+    if (servidor)
+        o << "<form class=\"me\" method=\"post\" action=\"/nome\"><input type=\"hidden\" name=\"volta\" value=\""
+          << h(volta) << "\"><b>Motorista</b><input name=\"nome\" value=\"" << h(motorista)
+          << "\" placeholder=\"Seu nome\" maxlength=\"40\"><button class=\"btn\">Salvar</button></form>";
+
+    o << "<div class=\"kpis\"><div class=\"kpi\"><small>Paradas feitas</small><b>" << feitos << "/" << total << "</b></div>"
+      << "<div class=\"kpi\"><small>Entregas</small><b>" << ent << "</b></div>"
+      << "<div class=\"kpi\"><small>Retiradas</small><b>" << ret << "</b></div>"
+      << "<div class=\"kpi" << (alertas ? " hot" : "") << "\"><small>Alertas de estoque</small><b>" << alertas << "</b></div></div>";
+
+    o << "<div class=\"cols\"><div>";
+    for (size_t d = 0; d < dias.size(); d++) o << htmlDia(dias[d], servidor, volta, fds);
     o << "</div><aside>";
 
-    /* estoque */
     string ini = hoje(), fim = somarDias(hoje(), 6);
     o << "<div class=\"panel\"><h4>Estoque (pr&oacute;ximos 7 dias)</h4><table><tr><th>Item</th><th>Livre hoje</th><th>Menor</th><th></th></tr>";
     for (size_t i = 0; i < itens.size(); i++) {
@@ -1658,14 +1834,13 @@ string htmlPainel(const string& dia, bool servidor, const string& motorista, con
     }
     o << "</table></div>";
 
-    /* proximos dias */
     o << "<div class=\"panel\"><h4>Pr&oacute;ximos 7 dias</h4><table><tr><th>Dia</th><th>Entregas</th><th>Retiradas</th></tr>";
     for (int k = 0; k < 7; k++) {
         string d = somarDias(hoje(), k);
         int e = 0, r = 0;
         for (size_t i = 0; i < servicos.size(); i++)
             if (servicos[i].data == d && servicos[i].status != "CANCELADO") (servicos[i].tipo == 'E' ? e : r)++;
-        o << "<tr><td>" << (servidor ? "<a href=\"" + link + dataParaLink(d) + "\">" : "")
+        o << "<tr><td>" << (servidor ? "<a href=\"/?d=" + dataParaLink(d) + "\">" : "")
           << diaSemana(d).substr(0, 3) << " " << d.substr(0, 5) << (servidor ? "</a>" : "")
           << "</td><td class=\"n\">" << e << "</td><td class=\"n\">" << r << "</td></tr>";
     }
@@ -1678,22 +1853,31 @@ string htmlPainel(const string& dia, bool servidor, const string& motorista, con
         o << "<div class=\"panel\"><h4>Aten&ccedil;&atilde;o</h4>" << atrasados
           << " parada(s) de dias anteriores sem baixa.</div>";
     o << "</aside></div></main><footer>Gerado pelo programa em C++ em " << hoje() << " &middot; "
-      << (servidor ? "atualiza sozinho a cada 30 s" : "arquivo somente leitura") << "</footer></body></html>";
+      << (servidor ? "atualiza sozinho a cada 30 s" : "c&oacute;pia do momento em que foi gerado") << "</footer></body></html>";
     return o.str();
 }
 
-void gerarPainelArquivo(const string& dia) {
+/* painel.html: o fim de semana inteiro. Pode ser mandado pelo WhatsApp
+   e aberto no celular mesmo sem internet (e uma copia do momento). */
+void gerarPainelArquivo(const vector<string>& dias) {
     ofstream f("painel.html");
-    f << htmlPainel(dia, false, "", "", false);
+    f << htmlPainel(dias, false, "", "", false, "/");
 }
 
-void gerarPainelArquivo() { gerarPainelArquivo(hoje()); }
+void gerarPainelArquivo() { gerarPainelArquivo(diasFimDeSemana()); }
 
 void abrirPainel() {
-    string dia = lerData("\nDia do painel", true);
+    string s = lerLinha("\nDia do painel (DD/MM, sab, dom; Enter = fim de semana): ");
+    vector<string> dias;
+    if (s.empty()) dias = diasFimDeSemana();
+    else {
+        string d = interpretarData(s);
+        if (d.empty()) { cout << "  ! Data invalida.\n"; return; }
+        dias.push_back(d);
+    }
     {
         Trava t;
-        gerarPainelArquivo(dia);
+        gerarPainelArquivo(dias);
     }
 #if defined(_WIN32)
     system("start \"\" painel.html");
@@ -1703,7 +1887,8 @@ void abrirPainel() {
     if (system("xdg-open painel.html >/dev/null 2>&1") != 0) {}
 #endif
     cout << "Arquivo painel.html gerado na pasta do programa. Se o navegador nao abrir,\n"
-            "de dois cliques nele. Ele tambem e atualizado sozinho a cada gravacao.\n";
+            "de dois cliques nele. Ele e recriado a cada gravacao com o fim de semana.\n"
+            "Dica: mande o painel.html pelo WhatsApp para os motoristas abrirem no celular.\n";
 }
 
 /* ---------- servidor HTTP minimo ---------- */
@@ -1772,6 +1957,17 @@ string paginaCodigo(bool errou) {
                   "<input name=\"pin\" inputmode=\"numeric\" autofocus><button class=\"btn\">Entrar</button></form></main></body></html>";
 }
 
+/* Endereco de retorno vindo do formulario: so caminhos internos. */
+string voltaSegura(const string& v) {
+    if (v.empty() || v[0] != '/' || v.find("//") != string::npos || v.find('\r') != string::npos ||
+        v.find('\n') != string::npos || v.find('"') != string::npos) return "/";
+    return v;
+}
+
+string comMensagem(const string& volta, const string& m) {
+    return volta + (volta.find('?') == string::npos ? "?" : "&") + "m=" + m;
+}
+
 /* Atende uma requisicao. Todo acesso aos dados fica dentro da trava. */
 void atender(Sock c) {
     string req;
@@ -1809,9 +2005,7 @@ void atender(Sock c) {
         }
     }
     string motorista = campo(cookies, "mot", ';');
-    string dLink = metodo == "POST" ? campo(corpo, "d", '&') : campo(query, "d", '&');
-    string dia = dLink.empty() ? hoje() : linkParaData(dLink);
-    string volta = "/?d=" + dataParaLink(dia);
+    string volta = voltaSegura(campo(corpo, "volta", '&'));
     const string umAno = "; Path=/; Max-Age=31536000; SameSite=Lax\r\n";
 
     if (caminho == "/entrar" && metodo == "POST") {
@@ -1827,11 +2021,11 @@ void atender(Sock c) {
     if (caminho == "/nome" && metodo == "POST") {
         string nome = trim(campo(corpo, "nome", '&')).substr(0, 40);
         for (size_t i = 0; i < nome.size(); i++) if (nome[i] == ';' || nome[i] == '|') nome[i] = ',';
-        redirecionar(c, volta + "&m=nome", "Set-Cookie: mot=" + urlEncode(nome) + umAno);
+        redirecionar(c, comMensagem(volta, "nome"), "Set-Cookie: mot=" + urlEncode(nome) + umAno);
         return;
     }
-    if ((caminho == "/baixa" || caminho == "/desfazer") && metodo == "POST") {
-        string m = "erro";
+    if ((caminho == "/baixa" || caminho == "/desfazer" || caminho == "/fila") && metodo == "POST") {
+        string m = "ja";
         if (caminho == "/baixa" && trim(motorista).empty()) m = "semnome";
         else {
             Trava t;
@@ -1849,23 +2043,35 @@ void atender(Sock c) {
                 servicos[idx].motorista = "";
                 salvarServicos();
                 m = "desfeito";
-            } else m = "ja";
+            } else if (idx >= 0 && caminho == "/fila" && servicos[idx].status == "PENDENTE") {
+                string r = mandarParaFimDaFila(idx);
+                m = "fila";
+                cout << "\n  [celular] " << (motorista.empty() ? string("motorista") : motorista) << ": "
+                     << nomeCliente(servicos[idx].clienteId) << " nao recebeu, foi para o fim da fila ("
+                     << (r.empty() ? "sem rota" : r) << ")\n";
+            }
         }
-        redirecionar(c, volta + "&m=" + m, "");
+        redirecionar(c, comMensagem(volta, m), "");
         return;
     }
     if (caminho == "/" && metodo == "GET") {
+        string dLink = campo(query, "d", '&');
         string m = campo(query, "m", '&'), msg;
         bool erro = false;
         if (m == "ok") msg = "Baixa registrada.";
         else if (m == "desfeito") msg = "Baixa desfeita.";
+        else if (m == "fila") msg = "Cliente enviado para o fim da fila.";
         else if (m == "nome") msg = "Nome salvo neste celular.";
         else if (m == "semnome") { msg = "Escreva seu nome no campo Motorista antes de dar baixa."; erro = true; }
         else if (m == "ja") { msg = "Essa parada j&aacute; tinha sido atualizada por outra pessoa."; erro = true; }
         string pagina;
         {
             Trava t;
-            pagina = htmlPainel(dia, true, motorista, msg, erro);
+            vector<string> dias;
+            string minhaVolta = "/";
+            if (dLink.empty()) dias = diasFimDeSemana();
+            else { dias.push_back(linkParaData(dLink)); minhaVolta = "/?d=" + dataParaLink(dias[0]); }
+            pagina = htmlPainel(dias, true, motorista, msg, erro, minhaVolta);
         }
         enviar(c, "200 OK", "", pagina);
         return;
