@@ -13,11 +13,49 @@
  *                   item ou quando o estoque fica abaixo do minimo, monta a
  *                   programacao do dia por rota (A1, A2, B1...) e registra a
  *                   baixa de cada parada.
+ *                   Gera um painel.html para ver no navegador e pode ligar
+ *                   um servidor na rede local para os motoristas darem
+ *                   baixa pelo celular.
  *  Tecnologia ....: C++ estruturado (funcoes + structs), menu de console,
- *                   persistencia em arquivos CSV (separador ';').
- *  Versao ........: 2.0
+ *                   persistencia em arquivos CSV (separador ';'), sockets
+ *                   (Winsock no Windows, POSIX no Linux/Mac).
+ *  Compilar ......: Windows (MinGW/Dev-C++): g++ -std=c++11 -o controle
+ *                     controle_entregas_retiradas_estoque.cpp -lws2_32
+ *                   Linux/Mac: g++ -std=c++11 -pthread -o controle
+ *                     controle_entregas_retiradas_estoque.cpp
+ *                   Visual Studio: projeto de console, nada a configurar.
+ *  Versao ........: 3.0
  * ==========================================================================
  */
+#ifdef _WIN32
+  #define _WINSOCK_DEPRECATED_NO_WARNINGS
+  #define _CRT_SECURE_NO_WARNINGS
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <windows.h>
+  #ifdef _MSC_VER
+    #pragma comment(lib, "ws2_32.lib")
+  #endif
+  typedef SOCKET Sock;
+  #define FECHAR closesocket
+  #define FLAG_ENVIO 0
+#else
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  #include <unistd.h>
+  #include <pthread.h>
+  typedef int Sock;
+  #define INVALID_SOCKET (-1)
+  #define FECHAR close
+  #define FLAG_ENVIO MSG_NOSIGNAL
+#endif
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -28,6 +66,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 using namespace std;
 
@@ -79,6 +118,25 @@ struct Servico {            // uma entrega OU uma retirada
 vector<Cliente> clientes;
 vector<Item> itens;
 vector<Servico> servicos;
+
+/* Trava dos dados: o servidor dos celulares roda em paralelo com o menu,
+   entao toda alteracao nos vetores acontece com a trava fechada. */
+#ifdef _WIN32
+CRITICAL_SECTION travaDados;
+void iniciarTrava() { InitializeCriticalSection(&travaDados); }
+struct Trava { Trava() { EnterCriticalSection(&travaDados); } ~Trava() { LeaveCriticalSection(&travaDados); } };
+#else
+pthread_mutex_t travaDados;
+void iniciarTrava() {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&travaDados, &a);
+}
+struct Trava { Trava() { pthread_mutex_lock(&travaDados); } ~Trava() { pthread_mutex_unlock(&travaDados); } };
+#endif
+
+void gerarPainelArquivo();   // definida no modulo do painel, mais abaixo
 
 /* ======================================================================
  *                       FUNCOES DE TEXTO E ENTRADA
@@ -420,6 +478,7 @@ bool csvParaItens(const string& s, vector<Qtd>& v) {
 }
 
 void salvarClientes() {
+    Trava t;
     ofstream f(ARQ_CLIENTES.c_str());
     f << "id;nome;telefone;endereco;bairro\n";
     for (size_t i = 0; i < clientes.size(); i++) {
@@ -430,6 +489,7 @@ void salvarClientes() {
 }
 
 void salvarItens() {
+    Trava t;
     ofstream f(ARQ_ITENS.c_str());
     f << "id;nome;total;minimo;ativo\n";
     for (size_t i = 0; i < itens.size(); i++) {
@@ -437,9 +497,12 @@ void salvarItens() {
         f << it.id << ';' << it.nome << ';' << it.total << ';' << it.minimo << ';'
           << (it.ativo ? 1 : 0) << '\n';
     }
+    f.close();
+    gerarPainelArquivo();
 }
 
 void salvarServicos() {
+    Trava t;
     ofstream f(ARQ_SERVICOS.c_str());
     f << "id;cliente_id;tipo;data;horario;rota;itens;outros;"
          "endereco;bairro;status;motorista;obs;vinculo\n";
@@ -450,6 +513,8 @@ void salvarServicos() {
           << s.outros << ';' << s.endereco << ';' << s.bairro << ';' << s.status << ';'
           << s.motorista << ';' << s.obs << ';' << s.vinculo << '\n';
     }
+    f.close();
+    gerarPainelArquivo();
 }
 
 void carregarClientes() {
@@ -708,8 +773,11 @@ int cadastrarCliente() {
     c.telefone = lerTexto("Telefone (opcional): ", false);
     c.endereco = lerTexto("Endereco (opcional): ", false);
     c.bairro = maiusculas(lerTexto("Bairro: ", true));
-    clientes.push_back(c);
-    salvarClientes();
+    {
+        Trava t;
+        clientes.push_back(c);
+        salvarClientes();
+    }
     cout << "Cliente cadastrado com ID " << c.id << ".\n";
     return c.id;
 }
@@ -745,13 +813,15 @@ void editarCliente() {
     if (id == 0) return;
     int i = indiceCliente(id);
     if (i < 0) { cout << "Cliente nao encontrado.\n"; return; }
-    Cliente& c = clientes[i];
+    Cliente c = clientes[i];                         // edita uma copia
     cout << "Enter mantem o valor atual.\n";
     string v;
     v = lerLinha("Nome [" + c.nome + "]: ");          if (!v.empty()) c.nome = v;
     v = lerLinha("Telefone [" + c.telefone + "]: ");  if (!v.empty()) c.telefone = v;
     v = lerLinha("Endereco [" + c.endereco + "]: ");  if (!v.empty()) c.endereco = v;
     v = lerLinha("Bairro [" + c.bairro + "]: ");      if (!v.empty()) c.bairro = maiusculas(v);
+    Trava t;
+    clientes[i] = c;
     salvarClientes();
     cout << "Cliente atualizado.\n";
 }
@@ -821,8 +891,11 @@ void cadastrarItem() {
     it.total = lerInteiro("Quantidade total que a empresa possui: ", 0, 999999);
     it.minimo = lerInteiroPadrao("Estoque minimo para avisar (Enter = 0): ", 0, 999999, 0);
     it.ativo = true;
-    itens.push_back(it);
-    salvarItens();
+    {
+        Trava t;
+        itens.push_back(it);
+        salvarItens();
+    }
     cout << "Item cadastrado com ID " << it.id << ".\n";
 }
 
@@ -831,7 +904,7 @@ void editarItem() {
     if (id == 0) return;
     int i = indiceItem(id);
     if (i < 0) { cout << "Item nao encontrado.\n"; return; }
-    Item& it = itens[i];
+    Item it = itens[i];                              // edita uma copia
     cout << "Enter mantem o valor atual.\n";
     string v = lerLinha("Nome [" + it.nome + "]: ");
     if (!v.empty()) it.nome = v;
@@ -839,6 +912,8 @@ void editarItem() {
     it.minimo = lerInteiroPadrao("Estoque minimo [" + to_string(it.minimo) + "]: ", 0, 999999, it.minimo);
     if (it.ativo) { if (lerSimNao("Desativar o item (deixa de aparecer nos pedidos)?")) it.ativo = false; }
     else if (lerSimNao("Item desativado. Reativar?")) it.ativo = true;
+    Trava t;
+    itens[i] = it;
     salvarItens();
     cout << "Item atualizado.\n";
 }
@@ -969,6 +1044,7 @@ int criarRetirada(int idEntrega) {
     r.motorista = "";
     r.obs = "";
     r.vinculo = idEntrega;
+    Trava t;
     servicos.push_back(r);
     servicos[indiceServico(idEntrega)].vinculo = r.id;
     salvarServicos();
@@ -1042,9 +1118,12 @@ void novoPedido() {
     r.obs = "";
     e.vinculo = r.id;
     r.vinculo = e.id;
-    servicos.push_back(e);
-    servicos.push_back(r);
-    salvarServicos();
+    {
+        Trava t;
+        servicos.push_back(e);
+        servicos.push_back(r);
+        salvarServicos();
+    }
     cout << "Pedido registrado: entrega ID " << e.id << " e retirada ID " << r.id << ".\n";
 }
 
@@ -1142,6 +1221,11 @@ void darBaixa() {
         if (m.empty()) m = ultimoMotorista;
         string obs = lerTexto("Observacao da baixa (opcional): ", false);
         if (!lerSimNao("Confirmar baixa de " + nomeCliente(servicos[idx].clienteId) + "?")) continue;
+        Trava t;
+        if (servicos[idx].status != "PENDENTE") {
+            cout << "  ! Essa parada acabou de receber baixa pelo celular.\n";
+            continue;
+        }
         Servico& s = servicos[idx];
         s.status = "FEITO";
         s.motorista = m;
@@ -1169,6 +1253,7 @@ void desfazerBaixa() {
     if (idx < 0) return;
     if (servicos[idx].status != "FEITO") { cout << "  ! Este agendamento nao esta como FEITO.\n"; return; }
     if (lerSimNao("Voltar para PENDENTE?")) {
+        Trava t;
         servicos[idx].status = "PENDENTE";
         servicos[idx].motorista = "";
         salvarServicos();
@@ -1217,6 +1302,7 @@ void reagendar() {
             return;
         }
     }
+    Trava t;
     servicos[idx].data = novaData;
     servicos[idx].horario = novoHorario;
     servicos[idx].rota = novaRota;
@@ -1239,6 +1325,7 @@ void cancelarPedido() {
         return;
     }
     if (!lerSimNao(iv >= 0 ? "Cancelar o pedido inteiro (entrega e retirada)?" : "Cancelar este agendamento?")) return;
+    Trava t;
     servicos[idx].status = "CANCELADO";
     if (iv >= 0) servicos[iv].status = "CANCELADO";
     salvarServicos();
@@ -1359,12 +1446,532 @@ void menuRelatorios() {
 }
 
 /* ======================================================================
+ *                 PAINEL HTML E SERVIDOR PARA CELULARES (RF20-RF22)
+ * ----------------------------------------------------------------------
+ *  - painel.html: gerado a cada gravacao. Abre em qualquer navegador e
+ *    mostra a programacao do dia, os alertas e o estoque (so leitura).
+ *  - Servidor: roda em segundo plano enquanto o menu continua livre.
+ *    Os celulares no mesmo Wi-Fi abrem http://IP-DO-PC:8080 e dao baixa
+ *    nas paradas. A pagina se atualiza sozinha a cada 30 segundos.
+ * ====================================================================== */
+
+/* ---------- texto seguro para HTML ---------- */
+bool utf8Valido(const string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = (unsigned char)s[i];
+        int n;
+        if (c < 0x80) n = 0;
+        else if ((c & 0xE0) == 0xC0) n = 1;
+        else if ((c & 0xF0) == 0xE0) n = 2;
+        else if ((c & 0xF8) == 0xF0) n = 3;
+        else return false;
+        if (n > 0 && i + n >= s.size()) return false;
+        for (int k = 1; k <= n; k++)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) return false;
+        i += n + 1;
+    }
+    return true;
+}
+
+/* O console do Windows grava acentos na pagina de codigo 850; o navegador
+   espera UTF-8. Converte as letras usadas em portugues. */
+string paraUtf8(const string& s) {
+    if (utf8Valido(s)) return s;
+    static const unsigned char de[] = {0xA0,0x82,0xA1,0xA2,0xA3,0x83,0x88,0x93,0xC6,0xE4,0x87,0x85,0x81,
+                                       0xB5,0x90,0xD6,0xE0,0xE9,0xB6,0xD2,0xE2,0xC7,0xE5,0x80,0xB7};
+    static const char* para[] = {"\xC3\xA1","\xC3\xA9","\xC3\xAD","\xC3\xB3","\xC3\xBA","\xC3\xA2","\xC3\xAA",
+                                 "\xC3\xB4","\xC3\xA3","\xC3\xB5","\xC3\xA7","\xC3\xA0","\xC3\xBC",
+                                 "\xC3\x81","\xC3\x89","\xC3\x8D","\xC3\x93","\xC3\x9A","\xC3\x82","\xC3\x8A",
+                                 "\xC3\x94","\xC3\x83","\xC3\x95","\xC3\x87","\xC3\x80"};
+    string r;
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) { r += (char)c; continue; }
+        bool achou = false;
+        for (size_t k = 0; k < sizeof de; k++)
+            if (de[k] == c) { r += para[k]; achou = true; break; }
+        if (!achou) r += '?';
+    }
+    return r;
+}
+
+string h(const string& s) {
+    string t = paraUtf8(s), r;
+    for (size_t i = 0; i < t.size(); i++) {
+        char c = t[i];
+        if (c == '&') r += "&amp;"; else if (c == '<') r += "&lt;"; else if (c == '>') r += "&gt;";
+        else if (c == '"') r += "&quot;"; else r += c;
+    }
+    return r;
+}
+
+/* DD/MM/AAAA <-> DD-MM-AAAA (formato usado nos links) */
+string dataParaLink(const string& d) { string r = d; replace(r.begin(), r.end(), '/', '-'); return r; }
+string linkParaData(const string& d) { string r = d; replace(r.begin(), r.end(), '-', '/'); return dataValida(r) ? r : hoje(); }
+
+const char* CSS_PAINEL = R"CSS(
+:root{--bg:#eef1f4;--card:#fff;--card2:#f6f8fa;--line:#d6dce3;--ink:#16202b;--muted:#5b6876;--accent:#c97a00;--accent-ink:#1b1300;--soft:#fff1d6;
+--ok:#1f7a4a;--ok-soft:#dcf2e5;--ok-ink:#fff;--warn:#a85c00;--warn-soft:#fde9cc;--bad:#b3261e;--bad-soft:#fbe2df;--ent:#1d5fa8;--ent-soft:#dde9f7;--ret:#6b3fa0;--ret-soft:#ece3f7}
+@media (prefers-color-scheme:dark){:root{--bg:#10161d;--card:#18212b;--card2:#1d2833;--line:#2b3845;--ink:#e6ecf2;--muted:#93a1b0;--accent:#f0a21c;--soft:#3a2a0a;
+--ok:#5ccf8e;--ok-soft:#173326;--ok-ink:#06210f;--warn:#f2b45a;--warn-soft:#3a2a12;--bad:#ff8a80;--bad-soft:#3d1d1b;--ent:#7fb2f0;--ent-soft:#18283b;--ret:#c3a2ee;--ret-soft:#2a2038;color-scheme:dark}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:0 16px}
+header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+header .wrap{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding-block:10px}
+h1{margin:0 auto 0 0;font:700 21px/1 "Arial Narrow",Arial,sans-serif;text-transform:uppercase;letter-spacing:.02em;display:flex;gap:10px;align-items:center}
+.sign{display:inline-grid;place-items:center;min-width:34px;height:26px;padding:0 6px;border-radius:5px;background:var(--accent);color:var(--accent-ink);font:700 13px ui-monospace,Consolas,monospace;border:2px solid var(--accent-ink)}
+.sign.none{background:var(--card2);color:var(--muted);border-color:var(--line)}
+.nav{display:flex;gap:6px;align-items:center}
+.btn{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:7px 12px;font:600 14px inherit;text-decoration:none;cursor:pointer}
+.btn.ok{background:var(--ok);border-color:var(--ok);color:var(--ok-ink);width:100%;padding:12px;font-size:16px}
+.btn.sm{padding:4px 9px;font-size:13px}
+main.wrap{padding-top:16px;padding-bottom:40px;display:grid;gap:16px}
+.day{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px}.day h2{margin:0;font:700 28px/1 "Arial Narrow",Arial,sans-serif;text-transform:uppercase}.day span{color:var(--muted)}
+.msg{border-radius:9px;padding:9px 12px;font-weight:600}.msg.ok{background:var(--ok-soft);color:var(--ok)}.msg.bad{background:var(--bad-soft);color:var(--bad)}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}.kpi small{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+.kpi b{display:block;font:700 28px/1.1 "Arial Narrow",Arial,sans-serif}.kpi.hot{border-color:var(--bad);background:var(--bad-soft)}.kpi.hot b{color:var(--bad)}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}@media(max-width:860px){.cols{grid-template-columns:minmax(0,1fr)}}
+.trip{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}.trip+.trip{margin-top:12px}
+.trip>h3{margin:0;display:flex;gap:10px;align-items:center;padding:9px 12px;background:var(--card2);border-bottom:1px solid var(--line);font:700 17px "Arial Narrow",Arial,sans-serif;text-transform:uppercase}
+.trip>h3 small{margin-left:auto;font:400 13px system-ui,sans-serif;color:var(--muted);text-transform:none}
+.stop{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:6px 12px;padding:12px;border-top:1px solid var(--line)}.stop:first-of-type{border-top:0}
+.stop>.pill{align-self:start}.stop .who b{font-size:16px}.stop .who small{display:block;color:var(--muted)}.stop.feito{opacity:.6}.stop.feito .who b{text-decoration:line-through}
+.stop .its{grid-column:2/-1;font:600 14px ui-monospace,Consolas,monospace}.stop .extra{grid-column:2/-1;font-size:13px;color:var(--muted)}
+.stop form,.stop .done{grid-column:1/-1}.done{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--muted)}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+.E{background:var(--ent-soft);color:var(--ent)}.R{background:var(--ret-soft);color:var(--ret)}
+.OK,.FEITO{background:var(--ok-soft);color:var(--ok)}.BAIXO,.PENDENTE{background:var(--warn-soft);color:var(--warn)}.FALTA{background:var(--bad-soft);color:var(--bad)}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}.panel+.panel{margin-top:12px}
+.panel h4{margin:0 0 8px;font:700 16px "Arial Narrow",Arial,sans-serif;text-transform:uppercase;color:var(--muted);letter-spacing:.04em}
+table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:6px 4px;border-bottom:1px solid var(--line);text-align:left}th{font-size:11.5px;color:var(--muted);text-transform:uppercase}
+td.n{text-align:right;font-family:ui-monospace,Consolas,monospace}
+.me{display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.me input{border:1px solid var(--line);background:var(--card2);color:var(--ink);border-radius:8px;padding:8px 10px;font:inherit;flex:1 1 140px;min-width:0}
+.empty{padding:24px;text-align:center;color:var(--muted)}footer{color:var(--muted);font-size:12.5px;text-align:center;padding-bottom:20px}
+)CSS";
+
+/* Monta a pagina do dia. 'servidor' liga os botoes de baixa. */
+string htmlPainel(const string& dia, bool servidor, const string& motorista, const string& msg, bool msgErro) {
+    ostringstream o;
+    vector<Servico> lista;
+    for (size_t i = 0; i < servicos.size(); i++)
+        if (servicos[i].data == dia && servicos[i].status != "CANCELADO") lista.push_back(servicos[i]);
+    sort(lista.begin(), lista.end(), vemAntes);
+    int feitos = 0, ent = 0, ret = 0;
+    for (size_t i = 0; i < lista.size(); i++) {
+        if (lista[i].status == "FEITO") feitos++;
+        if (lista[i].tipo == 'E') ent++; else ret++;
+    }
+    int alertas = contarAlertas();
+    string link = "/?d=";
+
+    o << "<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\">"
+         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+    if (servidor) o << "<meta http-equiv=\"refresh\" content=\"30;url=" << link << dataParaLink(dia) << "\">";
+    o << "<title>Painel de Rotas</title><style>" << CSS_PAINEL << "</style></head><body>"
+      << "<header><div class=\"wrap\"><h1><span class=\"sign\">A1</span>Painel de Rotas</h1>";
+    if (servidor)
+        o << "<nav class=\"nav\"><a class=\"btn sm\" href=\"" << link << dataParaLink(somarDias(dia, -1)) << "\">&lsaquo;</a>"
+          << "<a class=\"btn sm\" href=\"/\">Hoje</a>"
+          << "<a class=\"btn sm\" href=\"" << link << dataParaLink(somarDias(dia, 1)) << "\">&rsaquo;</a></nav>";
+    o << "</div></header><main class=\"wrap\">";
+
+    o << "<div class=\"day\"><h2>" << diaSemana(dia) << " " << dia.substr(0, 5) << "</h2><span>"
+      << (dia == hoje() ? "hoje" : dia) << "</span></div>";
+    if (!msg.empty()) o << "<div class=\"msg " << (msgErro ? "bad" : "ok") << "\">" << msg << "</div>";
+    if (servidor)
+        o << "<form class=\"me\" method=\"post\" action=\"/nome\"><input type=\"hidden\" name=\"d\" value=\""
+          << dataParaLink(dia) << "\"><b>Motorista</b><input name=\"nome\" value=\"" << h(motorista)
+          << "\" placeholder=\"Seu nome\" maxlength=\"40\"><button class=\"btn\">Salvar</button></form>";
+
+    o << "<div class=\"kpis\"><div class=\"kpi\"><small>Paradas feitas</small><b>" << feitos << "/" << lista.size() << "</b></div>"
+      << "<div class=\"kpi\"><small>Entregas</small><b>" << ent << "</b></div>"
+      << "<div class=\"kpi\"><small>Retiradas</small><b>" << ret << "</b></div>"
+      << "<div class=\"kpi" << (alertas ? " hot" : "") << "\"><small>Alertas de estoque</small><b>" << alertas << "</b></div></div>";
+
+    o << "<div class=\"cols\"><div>";
+    if (lista.empty()) o << "<div class=\"trip\"><div class=\"empty\">Nada agendado para este dia.</div></div>";
+    char viagemAtual = 0;
+    for (size_t i = 0; i < lista.size(); i++) {
+        const Servico& s = lista[i];
+        char viagem = s.rota.empty() ? '-' : s.rota[0];
+        if (viagem != viagemAtual) {
+            if (viagemAtual) o << "</div>";
+            int tot = 0, fe = 0;
+            for (size_t k = 0; k < lista.size(); k++) {
+                char vk = lista[k].rota.empty() ? '-' : lista[k].rota[0];
+                if (vk == viagem) { tot++; if (lista[k].status == "FEITO") fe++; }
+            }
+            o << "<div class=\"trip\"><h3>" << (viagem == '-' ? "<span class=\"sign none\">?</span>Sem rota definida"
+                                                              : string("<span class=\"sign\">") + viagem + "</span>Viagem " + viagem)
+              << "<small>" << fe << "/" << tot << " feitas</small></h3>";
+            viagemAtual = viagem;
+        }
+        int ic = indiceCliente(s.clienteId);
+        string tel = ic >= 0 ? clientes[ic].telefone : "";
+        o << "<div class=\"stop" << (s.status == "FEITO" ? " feito" : "") << "\">"
+          << (s.rota.empty() ? "<span class=\"sign none\">-</span>" : "<span class=\"sign\">" + h(s.rota) + "</span>")
+          << "<div class=\"who\"><b>" << h(nomeCliente(s.clienteId)) << "</b><small>"
+          << (s.horario.empty() ? "sem hor&aacute;rio" : s.horario) << " &middot; " << h(s.bairro)
+          << (s.endereco.empty() ? "" : " &middot; " + h(s.endereco)) << "</small></div>"
+          << "<span class=\"pill " << s.tipo << "\">" << (s.tipo == 'E' ? "Entrega" : "Retirada") << "</span>"
+          << "<div class=\"its\">" << h(textoItens(s)) << "</div>";
+        string extra;
+        if (!tel.empty()) extra += "Tel. " + h(tel);
+        if (!s.obs.empty()) extra += (extra.empty() ? "" : " &middot; ") + h(s.obs);
+        if (!extra.empty()) o << "<div class=\"extra\">" << extra << "</div>";
+        if (s.status == "FEITO") {
+            o << "<div class=\"done\"><span class=\"pill FEITO\">Feito</span>"
+              << (s.motorista.empty() ? "" : "por " + h(s.motorista));
+            if (servidor)
+                o << "<form method=\"post\" action=\"/desfazer\" style=\"margin-left:auto\"><input type=\"hidden\" name=\"id\" value=\""
+                  << s.id << "\"><input type=\"hidden\" name=\"d\" value=\"" << dataParaLink(dia)
+                  << "\"><button class=\"btn sm\">Desfazer</button></form>";
+            o << "</div>";
+        } else if (servidor) {
+            o << "<form method=\"post\" action=\"/baixa\"><input type=\"hidden\" name=\"id\" value=\"" << s.id
+              << "\"><input type=\"hidden\" name=\"d\" value=\"" << dataParaLink(dia) << "\"><button class=\"btn ok\">&check; "
+              << (s.tipo == 'E' ? "Entregue" : "Retirado") << "</button></form>";
+        } else {
+            o << "<div class=\"done\"><span class=\"pill PENDENTE\">Pendente</span></div>";
+        }
+        o << "</div>";
+    }
+    if (viagemAtual) o << "</div>";
+    o << "</div><aside>";
+
+    /* estoque */
+    string ini = hoje(), fim = somarDias(hoje(), 6);
+    o << "<div class=\"panel\"><h4>Estoque (pr&oacute;ximos 7 dias)</h4><table><tr><th>Item</th><th>Livre hoje</th><th>Menor</th><th></th></tr>";
+    for (size_t i = 0; i < itens.size(); i++) {
+        const Item& it = itens[i];
+        if (!it.ativo) continue;
+        string d;
+        int menor = it.total - picoNoPeriodo(it.id, ini, fim, 0, &d);
+        string sit = menor < 0 ? "FALTA" : (menor < it.minimo ? "BAIXO" : "OK");
+        o << "<tr><td>" << h(it.nome) << "</td><td class=\"n\">" << it.total - comprometido(it.id, ini, 0)
+          << "/" << it.total << "</td><td class=\"n\">" << menor << " <small>" << d.substr(0, 5) << "</small></td>"
+          << "<td><span class=\"pill " << sit << "\">" << (sit == "OK" ? "OK" : sit == "BAIXO" ? "Baixo" : "Falta")
+          << "</span></td></tr>";
+    }
+    o << "</table></div>";
+
+    /* proximos dias */
+    o << "<div class=\"panel\"><h4>Pr&oacute;ximos 7 dias</h4><table><tr><th>Dia</th><th>Entregas</th><th>Retiradas</th></tr>";
+    for (int k = 0; k < 7; k++) {
+        string d = somarDias(hoje(), k);
+        int e = 0, r = 0;
+        for (size_t i = 0; i < servicos.size(); i++)
+            if (servicos[i].data == d && servicos[i].status != "CANCELADO") (servicos[i].tipo == 'E' ? e : r)++;
+        o << "<tr><td>" << (servidor ? "<a href=\"" + link + dataParaLink(d) + "\">" : "")
+          << diaSemana(d).substr(0, 3) << " " << d.substr(0, 5) << (servidor ? "</a>" : "")
+          << "</td><td class=\"n\">" << e << "</td><td class=\"n\">" << r << "</td></tr>";
+    }
+    o << "</table></div>";
+
+    int atrasados = 0;
+    for (size_t i = 0; i < servicos.size(); i++)
+        if (servicos[i].status == "PENDENTE" && chaveData(servicos[i].data) < chaveData(hoje())) atrasados++;
+    if (atrasados)
+        o << "<div class=\"panel\"><h4>Aten&ccedil;&atilde;o</h4>" << atrasados
+          << " parada(s) de dias anteriores sem baixa.</div>";
+    o << "</aside></div></main><footer>Gerado pelo programa em C++ em " << hoje() << " &middot; "
+      << (servidor ? "atualiza sozinho a cada 30 s" : "arquivo somente leitura") << "</footer></body></html>";
+    return o.str();
+}
+
+void gerarPainelArquivo(const string& dia) {
+    ofstream f("painel.html");
+    f << htmlPainel(dia, false, "", "", false);
+}
+
+void gerarPainelArquivo() { gerarPainelArquivo(hoje()); }
+
+void abrirPainel() {
+    string dia = lerData("\nDia do painel", true);
+    {
+        Trava t;
+        gerarPainelArquivo(dia);
+    }
+#if defined(_WIN32)
+    system("start \"\" painel.html");
+#elif defined(__APPLE__)
+    system("open painel.html");
+#else
+    if (system("xdg-open painel.html >/dev/null 2>&1") != 0) {}
+#endif
+    cout << "Arquivo painel.html gerado na pasta do programa. Se o navegador nao abrir,\n"
+            "de dois cliques nele. Ele tambem e atualizado sozinho a cada gravacao.\n";
+}
+
+/* ---------- servidor HTTP minimo ---------- */
+volatile bool servidorLigado = false;
+Sock socketServidor = INVALID_SOCKET;
+int portaServidor = 8080;
+string pinServidor;
+string enderecoServidor;
+
+string urlDecode(const string& s) {
+    string r;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '+') r += ' ';
+        else if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) && isxdigit((unsigned char)s[i + 2])) {
+            r += (char)strtol(s.substr(i + 1, 2).c_str(), NULL, 16);
+            i += 2;
+        } else r += s[i];
+    }
+    return r;
+}
+
+string urlEncode(const string& s) {
+    string r;
+    const char* hex = "0123456789ABCDEF";
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (isalnum(c) || c == '-' || c == '_' || c == '.') r += (char)c;
+        else { r += '%'; r += hex[c >> 4]; r += hex[c & 15]; }
+    }
+    return r;
+}
+
+/* "a=1&b=2" ou "a=1; b=2" -> valor da chave */
+string campo(const string& texto, const string& chave, char sep) {
+    vector<string> partes = dividir(texto, sep);
+    for (size_t i = 0; i < partes.size(); i++) {
+        string p = trim(partes[i]);
+        size_t eq = p.find('=');
+        if (eq != string::npos && p.substr(0, eq) == chave) return urlDecode(p.substr(eq + 1));
+    }
+    return "";
+}
+
+void enviar(Sock c, const string& status, const string& extraHeaders, const string& corpo) {
+    string resp = "HTTP/1.1 " + status + "\r\nContent-Type: text/html; charset=utf-8\r\n"
+                  "Cache-Control: no-store\r\nConnection: close\r\nContent-Length: " + to_string(corpo.size()) +
+                  "\r\n" + extraHeaders + "\r\n" + corpo;
+    size_t enviado = 0;
+    while (enviado < resp.size()) {
+        int n = send(c, resp.c_str() + enviado, (int)(resp.size() - enviado), FLAG_ENVIO);
+        if (n <= 0) break;
+        enviado += (size_t)n;
+    }
+}
+
+void redirecionar(Sock c, const string& destino, const string& cookie) {
+    enviar(c, "303 See Other", "Location: " + destino + "\r\n" + cookie, "");
+}
+
+string paginaCodigo(bool errou) {
+    return string("<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                  "<title>Painel de Rotas</title><style>") + CSS_PAINEL + "</style></head><body><main class=\"wrap\" style=\"max-width:420px\">"
+                  "<div class=\"day\"><h2>Painel de Rotas</h2></div>" +
+                  (errou ? "<div class=\"msg bad\">C&oacute;digo incorreto.</div>" : "") +
+                  "<form class=\"me\" method=\"post\" action=\"/entrar\"><b>C&oacute;digo de acesso</b>"
+                  "<input name=\"pin\" inputmode=\"numeric\" autofocus><button class=\"btn\">Entrar</button></form></main></body></html>";
+}
+
+/* Atende uma requisicao. Todo acesso aos dados fica dentro da trava. */
+void atender(Sock c) {
+    string req;
+    char buf[4096];
+    size_t fimCab = string::npos;
+    while (req.size() < 65536) {
+        int n = recv(c, buf, sizeof buf, 0);
+        if (n <= 0) break;
+        req.append(buf, n);
+        fimCab = req.find("\r\n\r\n");
+        if (fimCab != string::npos) {
+            size_t cl = 0;
+            string baixo = req.substr(0, fimCab);
+            for (size_t i = 0; i < baixo.size(); i++) baixo[i] = (char)tolower((unsigned char)baixo[i]);
+            size_t p = baixo.find("content-length:");
+            if (p != string::npos) cl = (size_t)atoi(baixo.substr(p + 15).c_str());
+            if (req.size() >= fimCab + 4 + cl) break;
+        }
+    }
+    if (fimCab == string::npos) return;
+    string cab = req.substr(0, fimCab), corpo = req.substr(fimCab + 4);
+    string metodo = cab.substr(0, cab.find(' '));
+    size_t a = cab.find(' ') + 1;
+    string alvo = cab.substr(a, cab.find(' ', a) - a);
+    string caminho = alvo.substr(0, alvo.find('?'));
+    string query = alvo.find('?') == string::npos ? "" : alvo.substr(alvo.find('?') + 1);
+    string cookies;
+    {
+        string baixo = cab;
+        for (size_t i = 0; i < baixo.size(); i++) baixo[i] = (char)tolower((unsigned char)baixo[i]);
+        size_t p = baixo.find("\r\ncookie:");
+        if (p != string::npos) {
+            size_t ini = p + 9, fim = cab.find("\r\n", ini);
+            cookies = cab.substr(ini, fim == string::npos ? string::npos : fim - ini);
+        }
+    }
+    string motorista = campo(cookies, "mot", ';');
+    string dLink = metodo == "POST" ? campo(corpo, "d", '&') : campo(query, "d", '&');
+    string dia = dLink.empty() ? hoje() : linkParaData(dLink);
+    string volta = "/?d=" + dataParaLink(dia);
+    const string umAno = "; Path=/; Max-Age=31536000; SameSite=Lax\r\n";
+
+    if (caminho == "/entrar" && metodo == "POST") {
+        string pin = campo(corpo, "pin", '&');
+        if (pin == pinServidor) redirecionar(c, "/", "Set-Cookie: pin=" + urlEncode(pin) + umAno);
+        else enviar(c, "200 OK", "", paginaCodigo(true));
+        return;
+    }
+    if (!pinServidor.empty() && campo(cookies, "pin", ';') != pinServidor) {
+        enviar(c, "200 OK", "", paginaCodigo(false));
+        return;
+    }
+    if (caminho == "/nome" && metodo == "POST") {
+        string nome = trim(campo(corpo, "nome", '&')).substr(0, 40);
+        for (size_t i = 0; i < nome.size(); i++) if (nome[i] == ';' || nome[i] == '|') nome[i] = ',';
+        redirecionar(c, volta + "&m=nome", "Set-Cookie: mot=" + urlEncode(nome) + umAno);
+        return;
+    }
+    if ((caminho == "/baixa" || caminho == "/desfazer") && metodo == "POST") {
+        string m = "erro";
+        if (caminho == "/baixa" && trim(motorista).empty()) m = "semnome";
+        else {
+            Trava t;
+            int idx = indiceServico(atoi(campo(corpo, "id", '&').c_str()));
+            if (idx >= 0 && caminho == "/baixa" && servicos[idx].status == "PENDENTE") {
+                servicos[idx].status = "FEITO";
+                servicos[idx].motorista = motorista;
+                salvarServicos();
+                m = "ok";
+                cout << "\n  [celular] " << motorista << " deu baixa: "
+                     << (servicos[idx].tipo == 'E' ? "entrega" : "retirada") << " de "
+                     << nomeCliente(servicos[idx].clienteId) << " (ID " << servicos[idx].id << ")\n";
+            } else if (idx >= 0 && caminho == "/desfazer" && servicos[idx].status == "FEITO") {
+                servicos[idx].status = "PENDENTE";
+                servicos[idx].motorista = "";
+                salvarServicos();
+                m = "desfeito";
+            } else m = "ja";
+        }
+        redirecionar(c, volta + "&m=" + m, "");
+        return;
+    }
+    if (caminho == "/" && metodo == "GET") {
+        string m = campo(query, "m", '&'), msg;
+        bool erro = false;
+        if (m == "ok") msg = "Baixa registrada.";
+        else if (m == "desfeito") msg = "Baixa desfeita.";
+        else if (m == "nome") msg = "Nome salvo neste celular.";
+        else if (m == "semnome") { msg = "Escreva seu nome no campo Motorista antes de dar baixa."; erro = true; }
+        else if (m == "ja") { msg = "Essa parada j&aacute; tinha sido atualizada por outra pessoa."; erro = true; }
+        string pagina;
+        {
+            Trava t;
+            pagina = htmlPainel(dia, true, motorista, msg, erro);
+        }
+        enviar(c, "200 OK", "", pagina);
+        return;
+    }
+    enviar(c, "404 Not Found", "", "<!doctype html><meta charset=\"utf-8\"><p>P&aacute;gina n&atilde;o encontrada. <a href=\"/\">Voltar</a></p>");
+}
+
+void lacoServidor() {
+    while (servidorLigado) {
+        Sock c = accept(socketServidor, NULL, NULL);
+        if (c == INVALID_SOCKET) { if (!servidorLigado) break; continue; }
+        atender(c);
+        FECHAR(c);
+    }
+}
+
+#ifdef _WIN32
+DWORD WINAPI lacoServidorWin(LPVOID) { lacoServidor(); return 0; }
+#else
+void* lacoServidorPosix(void*) { lacoServidor(); return NULL; }
+#endif
+
+/* Descobre o IP do PC na rede local (nao envia nada pela rede). */
+string ipLocal() {
+    Sock s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCKET) return "";
+    sockaddr_in destino;
+    memset(&destino, 0, sizeof destino);
+    destino.sin_family = AF_INET;
+    destino.sin_port = htons(80);
+    destino.sin_addr.s_addr = inet_addr("8.8.8.8");
+    string ip;
+    if (connect(s, (sockaddr*)&destino, sizeof destino) == 0) {
+        sockaddr_in local;
+        socklen_t tam = sizeof local;
+        if (getsockname(s, (sockaddr*)&local, &tam) == 0) ip = inet_ntoa(local.sin_addr);
+    }
+    FECHAR(s);
+    return ip;
+}
+
+void ligarServidor() {
+    cout << "\n=== SERVIDOR PARA OS CELULARES ===\n";
+    portaServidor = lerInteiroPadrao("Porta (Enter = 8080): ", 1024, 65535, 8080);
+    pinServidor = lerLinha("Codigo de acesso para os motoristas (Enter = sem codigo): ");
+    Sock s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) { cout << "  ! Nao foi possivel criar o servidor.\n"; return; }
+    int sim = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&sim, sizeof sim);
+    sockaddr_in end;
+    memset(&end, 0, sizeof end);
+    end.sin_family = AF_INET;
+    end.sin_addr.s_addr = htonl(INADDR_ANY);
+    end.sin_port = htons((unsigned short)portaServidor);
+    if (bind(s, (sockaddr*)&end, sizeof end) != 0 || listen(s, 8) != 0) {
+        cout << "  ! A porta " << portaServidor << " esta em uso. Tente outra.\n";
+        FECHAR(s);
+        return;
+    }
+    socketServidor = s;
+    servidorLigado = true;
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 0, lacoServidorWin, NULL, 0, NULL);
+    if (th) CloseHandle(th);
+#else
+    pthread_t th;
+    pthread_create(&th, NULL, lacoServidorPosix, NULL);
+    pthread_detach(th);
+#endif
+    string ip = ipLocal();
+    enderecoServidor = "http://" + (ip.empty() ? string("IP-DO-PC") : ip) + ":" + to_string(portaServidor);
+    cout << "Servidor ligado. Nos celulares (mesmo Wi-Fi), abra:\n\n    " << enderecoServidor << "\n\n"
+         << "Neste PC: http://localhost:" << portaServidor << "\n"
+         << (pinServidor.empty() ? "Sem codigo de acesso: qualquer pessoa no Wi-Fi consegue dar baixa.\n"
+                                 : "Os motoristas vao digitar o codigo uma vez em cada celular.\n")
+         << "Se o Windows perguntar sobre o firewall, permita o acesso em redes privadas.\n"
+         << "O menu continua funcionando normalmente enquanto o servidor estiver ligado.\n";
+}
+
+void desligarServidor() {
+    servidorLigado = false;
+    if (socketServidor != INVALID_SOCKET) {
+#ifdef _WIN32
+        closesocket(socketServidor);
+#else
+        shutdown(socketServidor, SHUT_RDWR);
+        close(socketServidor);
+#endif
+        socketServidor = INVALID_SOCKET;
+    }
+    cout << "Servidor desligado.\n";
+}
+
+/* ======================================================================
  *                                 MAIN
  * ====================================================================== */
 int main() {
+    iniciarTrava();
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
     carregarClientes();
     carregarItens();
     carregarServicos();
+    gerarPainelArquivo();
 
     while (true) {
         int pendHoje = 0;
@@ -1379,6 +1986,8 @@ int main() {
         if (alertas)
             cout << "  !! " << alertas << " item(ns) com estoque baixo ou em falta nos\n"
                     "     proximos 7 dias (veja a opcao 6)\n";
+        if (servidorLigado)
+            cout << "  Celulares: " << enderecoServidor << "\n";
         cout << "==============================================\n"
                 "1 - Clientes\n"
                 "2 - Novo pedido (entrega + retirada)\n"
@@ -1386,8 +1995,10 @@ int main() {
                 "4 - Dar baixa / alterar / cancelar\n"
                 "5 - Consultas e relatorios\n"
                 "6 - Itens e estoque\n"
-                "0 - Sair\n";
-        int op = lerInteiro("Opcao: ", 0, 6);
+                "7 - Abrir painel no navegador\n"
+             << (servidorLigado ? "8 - Desligar servidor dos celulares\n" : "8 - Ligar servidor para os celulares\n")
+             << "0 - Sair\n";
+        int op = lerInteiro("Opcao: ", 0, 8);
         switch (op) {
             case 1: menuClientes(); break;
             case 2: novoPedido(); break;
@@ -1395,7 +2006,12 @@ int main() {
             case 4: menuAgendamentos(); break;
             case 5: menuRelatorios(); break;
             case 6: menuItens(); break;
-            case 0: cout << "Ate logo!\n"; return 0;
+            case 7: abrirPainel(); break;
+            case 8: if (servidorLigado) desligarServidor(); else ligarServidor(); break;
+            case 0:
+                if (servidorLigado) desligarServidor();
+                cout << "Ate logo!\n";
+                return 0;
         }
     }
 }
