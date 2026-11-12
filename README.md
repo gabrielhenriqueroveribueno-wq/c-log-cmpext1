@@ -1,82 +1,105 @@
-# Controle de Entregas e Retiradas — CMPEXT1
+# Controle de Entregas, Retiradas e Estoque — CMPEXT1
 
 Esboço minimamente funcional do projeto de extensão (TADS-EAD IFSP).
-Demandante: empresa de locação de mesas e cadeiras.
+Demandante: empresa de locação de mesas, cadeiras e itens para festas.
+Versão 3.0 — arquivo `controle_entregas_retiradas_estoque.cpp`.
 
 ## Como compilar e rodar
 
-- **Linux / Mac:** `g++ -std=c++17 -o logistica main.cpp` e depois `./logistica`
-- **Windows (Dev-C++, Code::Blocks, VS Code com MinGW):** abrir `main.cpp`, compilar e executar.
-- **Visual Studio:** novo projeto "Aplicativo de Console" C++, colar o conteúdo de `main.cpp`.
+| Ambiente | Comando |
+|---|---|
+| Windows sem compilar | dê dois cliques em `controle.exe` (já vem pronto no pacote) |
+| Windows (MinGW / Dev-C++) | `g++ -std=c++11 -o controle controle_entregas_retiradas_estoque.cpp -lws2_32` |
+| Dev-C++ pela interface | Projeto → Opções do projeto → Parâmetros → Linker: `-lws2_32` |
+| Visual Studio | projeto "Aplicativo de Console" C++, colar o código; nada a configurar |
+| Linux / Mac | `g++ -std=c++11 -pthread -o controle controle_entregas_retiradas_estoque.cpp` |
 
-Os arquivos `clientes.csv`, `servicos.csv` e `config.csv` são criados na mesma pasta do programa
-na primeira gravação. Abrem no Excel (separador `;`).
+Os arquivos `clientes.csv`, `itens.csv`, `servicos.csv` e `painel.html` ficam na mesma pasta do programa.
+Para começar com dados, copie os CSV da pasta `dados_exemplo` para junto do programa.
 
 ## Mapa de funcionalidades
 
 ```
 MENU PRINCIPAL
 ├── 1 Clientes ............ cadastrar · pesquisar · listar · editar
-├── 2 Agendar ............. entrega ou retirada (+ retirada vinculada à entrega)
-├── 3 Programação do dia .. roteiro ordenado por rota (A1, A2, B1...) + exportar TXT
-├── 4 Baixa / alterações .. dar baixa · desfazer baixa · reagendar/mudar rota · cancelar
-├── 5 Relatórios .......... atrasados · próximos 7 dias · histórico do cliente
-│                           · mesas/cadeiras fora do depósito · entregas sem retirada
-└── 6 Estoque total ....... quantidade de mesas e cadeiras da empresa
+├── 2 Novo pedido ......... entrega + retirada obrigatória (só pede data e horário da retirada;
+│                           endereço e itens são os mesmos), mostra o livre de cada item
+│                           e avisa FALTA ou ESTOQUE BAIXO antes de confirmar
+├── 3 Programação do dia .. roteiro por rota (A1, A2, B1...), itens que saem e voltam, TXT
+├── 4 Baixa / alterações .. dar baixa · desfazer · reagendar (reconfere o estoque) · cancelar pedido
+├── 5 Relatórios .......... atrasados · próximos 7 dias · histórico do cliente · entregas sem retirada
+├── 6 Itens e estoque ..... estoque e alertas · cadastrar · editar/desativar · disponibilidade no período
+├── 7 Abrir painel ........ gera painel.html e abre no navegador
+└── 8 Servidor celulares .. liga/desliga o servidor na rede local para os motoristas
 ```
+
+## Painel e celulares
+
+- **painel.html**: o programa recria o arquivo a cada gravação. Mostra o dia por viagem, o que já foi feito,
+  os alertas e o estoque. É só leitura.
+- **Servidor (opção 8)**: o programa abre um servidor web na rede local, em segundo plano. O menu continua livre.
+  O programa mostra o endereço (ex.: `http://192.168.0.15:8080`). Nos celulares conectados ao mesmo Wi-Fi,
+  o motorista abre esse endereço, digita o código de acesso (se houver) e o nome uma vez, e toca em
+  **✓ Entregue / Retirado**. A baixa é gravada no `servicos.csv` na hora, aparece no console e a página
+  se atualiza sozinha a cada 30 segundos.
+- Limitações: o PC precisa ficar ligado e na mesma rede dos celulares; fora do Wi-Fi da empresa não funciona.
+  Na primeira vez, o Windows pergunta sobre o firewall: permita em redes privadas.
 
 ## Leiaute dos arquivos
 
+**itens.csv** — `id;nome;total;minimo;ativo`
+```
+1;Mesa;40;5;1
+```
+
 **clientes.csv** — `id;nome;telefone;endereco;bairro`
-```
-1;Buffet Alegria;16999990000;Rua A, 10;CENTRO
-```
 
-**servicos.csv** — `id;cliente_id;tipo;data;horario;rota;mesas;cadeiras;outros;endereco;bairro;status;motorista;obs;vinculo`
+**servicos.csv** — `id;cliente_id;tipo;data;horario;rota;itens;outros;endereco;bairro;status;motorista;obs;vinculo`
 ```
-1;2;E;24/10/2026;08:00;A1;5;40;;Rua B, 5;JARDIM PAULISTA;FEITO;Joao;Festa 15 anos;2
+3;2;E;12/11/2026;08:30;A2;1:20|2:160|3:20;montagem;Av. Brasil, 900;CENTRO;PENDENTE;;;4
+4;2;R;13/11/2026;18:00;C1;1:20|2:160|3:20;montagem;Av. Brasil, 900;CENTRO;PENDENTE;;;3
 ```
-- `tipo`: E = entrega, R = retirada
-- `rota`: letra = viagem do carro, número = ordem da parada (A1, A2 → volta ao depósito → B1...)
-- `status`: PENDENTE, FEITO, CANCELADO
-- `vinculo`: id da retirada/entrega par (0 = sem par)
+- `itens`: `id_do_item:quantidade` separados por `|`
+- `tipo`: E = entrega, R = retirada · `status`: PENDENTE, FEITO, CANCELADO
+- `vinculo`: id da outra parte do pedido (entrega ↔ retirada)
+- O `servicos.csv` da versão 1 (com colunas de mesas e cadeiras) é convertido sozinho na primeira abertura.
 
-**config.csv** — `chave;valor` (ESTOQUE_MESAS, ESTOQUE_CADEIRAS)
+## Regras de negócio
+
+- Todo pedido gera uma entrega e uma retirada. A retirada tem data e horário obrigatórios e não pode ser antes da entrega.
+- Um item fica reservado do dia da entrega até o dia da retirada (inclusive).
+- Livre no período = total do item − maior quantidade reservada em algum dia do período.
+- **FALTA**: o pedido passa do livre; o programa pergunta se registra assim mesmo.
+- **ESTOQUE BAIXO**: o que sobra fica abaixo do mínimo cadastrado; o programa avisa.
+- Cancelar a entrega ou a retirada cancela o pedido inteiro e libera os itens.
+- Parte do pedido que já teve baixa não pode ser cancelada (desfaça a baixa ou reagende).
 
 ## Requisitos implementados
 
 | ID | Requisito | Origem |
 |----|-----------|--------|
-| RF01 | Cadastrar cliente (nome, telefone, endereço, bairro) | Áudio 1 |
-| RF02 | Pesquisar cliente por parte do nome ou telefone | Apostila (cadastro completo) |
-| RF03 | Listar e editar clientes | Apostila |
-| RF04 | Agendar entrega/retirada com tipo, dia, horário, bairro, mesas, cadeiras e outros itens | Áudio 1 |
-| RF05 | Informar a rota (A1, A2, B1...) e avisar rota repetida no mesmo dia | Áudio 1 + imagem |
-| RF06 | Agendar a retirada ligada a uma entrega, com os mesmos itens | Áudio 2 |
-| RF07 | Listar a programação do dia agrupada por viagem e ordenada por rota | Áudio 1 |
-| RF08 | Exportar o roteiro do dia em TXT para imprimir | Áudio 2 (planilha impressa) |
-| RF09 | Dar baixa registrando o motorista | Áudios 1 e 2 (lousa / riscar no papel) |
-| RF10 | Reagendar (data, horário, rota) e cancelar | Áudio 2 |
-| RF11 | Listar pendências de dias anteriores sem baixa | Áudio 1 ("o que não foi feito") |
-| RF12 | Resumo dos próximos 7 dias | Áudio 2 (lousa semanal) |
-| RF13 | Mesas e cadeiras fora do depósito | Regra de negócio |
-| RF14 | Entregas que ainda não têm retirada agendada | Áudio 1 ("onde precisa ser feito") |
-| RNF01 | Console, programação estruturada, arquivos CSV, sem internet | Disciplina |
-| RNF02 | Cada operação é gravada no arquivo na hora da confirmação | Apostila M3 |
-| RNF03 | Guardar só nome, telefone e endereço do cliente (LGPD) | Apostila M3 |
+| RF01–RF03 | Cadastrar, pesquisar, listar e editar clientes | Áudio 1 / apostila |
+| RF04 | Registrar pedido com cliente, itens, dia, horário, bairro e endereço | Áudio 1 |
+| RF05 | Rota A1, A2, B1… e aviso de rota repetida no dia | Áudio 1 + imagem |
+| RF06 | Retirada obrigatória em todo pedido, com mesmo endereço e itens | Pedido do grupo / Áudio 2 |
+| RF07–RF08 | Programação do dia por viagem e exportação em TXT | Áudios 1 e 2 |
+| RF09–RF11 | Baixa com motorista, desfazer, reagendar e cancelar | Áudios 1 e 2 |
+| RF12–RF15 | Atrasados, próximos 7 dias, histórico do cliente, entregas sem retirada | Áudio 1 |
+| RF16 | Cadastro de todos os itens de locação com total e mínimo | Pedido do grupo |
+| RF17 | Disponibilidade de cada item no período do pedido | Pedido do grupo |
+| RF18 | Aviso de falta e de estoque abaixo do mínimo | Pedido do grupo |
+| RF19 | Itens na rua (saíram com baixa e não voltaram) | Regra de negócio |
+| RF20 | Painel em HTML gerado pelo programa | Pedido do grupo |
+| RF21 | Baixa pelo celular na rede local | Áudio 1 (vários celulares) |
+| RF22 | Código de acesso opcional para os celulares | Segurança |
+| RNF01 | C++ estruturado, console, CSV, sem banco de dados | Disciplina |
+| RNF02 | Cada operação é gravada na hora | Apostila M3 |
+| RNF03 | Só nome, telefone e endereço do cliente (LGPD) | Apostila M3 |
+| RNF04 | Compila no Windows, Linux e Mac | Disciplina |
 
-## Regras de negócio
+## Fora do escopo (evolução futura)
 
-- Todo agendamento precisa de mesas, cadeiras ou a descrição de outro item.
-- A retirada nunca pode ser antes da entrega ligada a ela.
-- Bairro `DEPOSITO` = o cliente busca ou devolve no depósito.
-- Datas aceitam `24/10`, `24/10/26` ou `24/10/2026`; horários aceitam `8`, `8h30`, `14:00`.
-
-## Fora do escopo (evolução futura — Projeto de Extensão 2)
-
-- Acesso por vários celulares ao mesmo tempo (os dois motoristas vendo e dando baixa na rota).
-  Foi o pedido principal do demandante, mas depende de banco de dados e internet,
-  conteúdos de semestres seguintes.
-- Aplicativo, painel web ou interface gráfica.
+- Acesso de fora da rede da empresa (precisaria de servidor na internet ou na nuvem).
+- Aplicativo instalado (APK).
 - Controle financeiro / pagamento dos eventos.
 - Integração com a planilha Excel online atual.
